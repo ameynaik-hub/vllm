@@ -81,6 +81,16 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+# SSM state precision emulation hook.
+# Set SSM_PRECISION_DTYPE=fp16_rtn (or fp16_sr, fp8_sr) to emulate lower-precision
+# state storage without modifying Triton kernels. fp32 (default) = no-op.
+import os as _os  # noqa: E402
+from ssm_precision.state_quantizer import StateQuantizer as _SQ  # noqa: E402
+_GDN_PRECISION = _os.environ.get("SSM_PRECISION_DTYPE", "fp32")
+_gdn_quantizer = _SQ.from_str(_GDN_PRECISION)
+if _gdn_quantizer is not None:
+    print(f"[ssm_precision] GDN state hook active: {_GDN_PRECISION}", flush=True)
+
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
@@ -1676,6 +1686,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+        # Emulated state precision: apply round-trip after kernel writes state in FP32.
+        if _gdn_quantizer is not None:
+            idx = non_spec_state_indices_tensor[:num_actual_tokens]
+            ssm_state[idx] = _gdn_quantizer(ssm_state[idx].float())
         return
 
 
