@@ -4,7 +4,7 @@
 set -euo pipefail
 
 IMG=${BENCH_IMG:-vllm/vllm-openai:nightly-6a9f24aa8cb856235528d01a829a4ba85fc1c19d}
-MODEL=${MODEL_35B:-/tmp/models/Qwen3.5-35B-A3B}
+MODEL=${MODEL_35B:-/home/scratch.ameyn_gpu_2/models/Qwen3.5-35B-A3B}
 GPUS=${CUDA_VISIBLE_DEVICES:-1,3}
 PORT=${PORT:-8000}
 CONTAINER=ssmprec_fp32_35b
@@ -22,7 +22,7 @@ exec docker run --name "$CONTAINER" \
   --gpus "\"device=$GPUS\"" \
   --network host --ipc host --shm-size 32g \
   -v /home/scratch.ameyn_gpu_2:/home/scratch.ameyn_gpu_2 \
-  -v /tmp:/tmp \
+
   --entrypoint bash \
   "$IMG" -c "
     set -ex
