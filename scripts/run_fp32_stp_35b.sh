@@ -1,28 +1,43 @@
 #!/usr/bin/env bash
-# FP32 SSM state, STP (standard per-step, no ReplaySSM), Qwen3.5-35B-A3B
-# Gold baseline: no precision emulation applied.
+# FP32 SSM state, STP (no ReplaySSM), Qwen3.5-35B-A3B, TP=2
+# Gold baseline: no precision emulation.
+# NOTE: 35B model not on local disk. Download first:
+#   huggingface-cli download Qwen/Qwen3.5-35B-A3B \
+#     --local-dir /home/scratch.ameyn_gpu_2/models/Qwen3.5-35B-A3B
 set -euo pipefail
 
-MODEL="/raid/data/vgimpelson/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754"
+IMG=${BENCH_IMG:-vllm/vllm-openai:nightly-6a9f24aa8cb856235528d01a829a4ba85fc1c19d}
+MODEL=${MODEL_35B:-/home/scratch.ameyn_gpu_2/models/Qwen3.5-35B-A3B}
+GPUS=${CUDA_VISIBLE_DEVICES:-0,1}
+PORT=${PORT:-8000}
+CONTAINER=ssmprec_fp32_35b
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 if [ ! -d "$MODEL" ]; then
-    echo "ERROR: model not found at $MODEL" >&2
-    echo "Re-download with: huggingface-cli download Qwen/Qwen3.5-35B-A3B --local-dir <path>" >&2
+    echo "ERROR: 35B model not found at $MODEL" >&2
+    echo "Download: huggingface-cli download Qwen/Qwen3.5-35B-A3B --local-dir $MODEL" >&2
     exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
-export SSM_PRECISION_DTYPE=fp32  # no-op — gold baseline
+docker rm -f "$CONTAINER" 2>/dev/null || true
 
-source /home/scratch.ameyn_gpu_2/venv/bin/activate
-export PYTHONPATH="$REPO_ROOT/python:$PYTHONPATH"
-
-python -m vllm.entrypoints.openai.api_server \
-    --model "$MODEL" \
-    --tensor-parallel-size 2 \
-    --dtype bfloat16 \
-    --enforce-eager \
-    --mamba-ssm-cache-dtype float32 \
-    --disable-log-requests \
-    --port 8000 \
-    "$@"
+exec docker run --name "$CONTAINER" \
+  --gpus "\"device=$GPUS\"" \
+  --network host --ipc host --shm-size 64g \
+  -v /home/scratch.ameyn_gpu_2:/home/scratch.ameyn_gpu_2 \
+  --entrypoint bash \
+  "$IMG" -c "
+    set -ex
+    VLLM_PKG=\$(python3 -c 'import vllm, os; print(os.path.dirname(vllm.__file__))')
+    cp -r $REPO_ROOT/vllm/. \"\$VLLM_PKG/\"
+    export PYTHONPATH=$REPO_ROOT:\${PYTHONPATH:-}
+    export SSM_PRECISION_DTYPE=fp32
+    python3 -m vllm.entrypoints.openai.api_server \
+      --model $MODEL \
+      --tensor-parallel-size 2 \
+      --dtype bfloat16 \
+      --enforce-eager \
+      --mamba-ssm-cache-dtype float32 \
+      --no-enable-log-requests \
+      --port $PORT
+  "

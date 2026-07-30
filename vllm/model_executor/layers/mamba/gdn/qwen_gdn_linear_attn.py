@@ -85,7 +85,7 @@ logger = init_logger(__name__)
 # Set SSM_PRECISION_DTYPE=fp16_rtn (or fp16_sr, fp8_sr) to emulate lower-precision
 # state storage without modifying Triton kernels. fp32 (default) = no-op.
 import os as _os  # noqa: E402
-from ssm_precision.state_quantizer import StateQuantizer as _SQ  # noqa: E402
+from vllm.ssm_precision.state_quantizer import StateQuantizer as _SQ  # noqa: E402
 _GDN_PRECISION = _os.environ.get("SSM_PRECISION_DTYPE", "fp32")
 _gdn_quantizer = _SQ.from_str(_GDN_PRECISION)
 if _gdn_quantizer is not None:
