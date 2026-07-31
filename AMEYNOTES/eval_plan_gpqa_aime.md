@@ -57,6 +57,11 @@ nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
 ```
 Need GPUs 0, 1, 2, 3 free (one per arm).
 
+### 3. Install ssm_precision into site-packages (inside each container)
+Instead of PYTHONPATH, copy `ssm_precision/` into the image's site-packages.
+This avoids any risk of shadowing the installed vllm package.
+Done once per container at startup (see run commands below).
+
 ---
 
 ## Run commands
@@ -67,6 +72,12 @@ REPO=/home/scratch.ameyn_gpu_2/vllm-ssm-precision-study
 SCRATCH=/home/scratch.ameyn_gpu_2
 ```
 
+Each container startup does:
+1. `pip install lm-eval[api]`
+2. Copy `ssm_precision/` into site-packages (avoids PYTHONPATH / vllm shadowing)
+3. Set `SSM_PRECISION_DTYPE` env var
+4. Run `python3 -m ssm_precision.run_lmeval`
+
 ### 35B FP32 — GPU 0
 ```bash
 docker run -d --name eval_35b_fp32 \
@@ -74,7 +85,8 @@ docker run -d --name eval_35b_fp32 \
   -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
   --entrypoint bash $IMG -c "
     pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    export PYTHONPATH=$REPO
+    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
+    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
     export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
     export SSM_PRECISION_DTYPE=fp32
     python3 -m ssm_precision.run_lmeval \
@@ -95,7 +107,8 @@ docker run -d --name eval_35b_fp16rtn \
   -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
   --entrypoint bash $IMG -c "
     pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    export PYTHONPATH=$REPO
+    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
+    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
     export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
     export SSM_PRECISION_DTYPE=fp16_rtn
     python3 -m ssm_precision.run_lmeval \
@@ -116,7 +129,8 @@ docker run -d --name eval_122b_fp32 \
   -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
   --entrypoint bash $IMG -c "
     pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    export PYTHONPATH=$REPO
+    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
+    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
     export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
     export SSM_PRECISION_DTYPE=fp32
     python3 -m ssm_precision.run_lmeval \
@@ -137,7 +151,8 @@ docker run -d --name eval_122b_fp16rtn \
   -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
   --entrypoint bash $IMG -c "
     pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    export PYTHONPATH=$REPO
+    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
+    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
     export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
     export SSM_PRECISION_DTYPE=fp16_rtn
     python3 -m ssm_precision.run_lmeval \
@@ -196,9 +211,11 @@ Key fields in `results_*.json`:
 ## Gotchas
 
 1. **NFS root_squash**: copy datasets to `/tmp/hf_home/` before running (see Prerequisites).
-2. **Hook check**: FP32 arms must NOT show `[ssm_precision]`; FP16 arms must show it.
-3. **TP=1, gpu_memory_utilization=0.90**: no NCCL overhead, clean startup on a free B200.
-4. **Results dir must be world-writable** (Docker writes as root):
+2. **ssm_precision into site-packages** (not PYTHONPATH): avoids shadowing the installed vllm.
+   Each container does `cp -r $REPO/ssm_precision/ $(site-packages)/ssm_precision/`.
+3. **Hook check**: FP32 arms must NOT show `[ssm_precision]`; FP16 arms must show it.
+4. **TP=1, gpu_memory_utilization=0.90**: no NCCL overhead, clean startup on a free B200.
+5. **Results dir must be world-writable** (Docker writes as root):
    ```bash
    chmod -R 777 /home/scratch.ameyn_gpu_2/vllm-ssm-precision-study/results/
    ```
