@@ -7,9 +7,11 @@ Equivalent of Johnny's Mamba2 pattern applied to GDN:
 Zero vLLM source changes. The Triton kernel runs unchanged; after it writes
 the state in FP32, the wrapper applies the precision round-trip in PyTorch.
 
-Install this package into the Python environment's site-packages so it is
-importable without PYTHONPATH — avoids shadowing the installed vllm:
-    cp -r ssm_precision/ $(python3 -c "import site; print(site.getsitepackages()[0])")/
+Usage — import this module before vLLM loads the model:
+    SSM_PRECISION_DTYPE=fp16_rtn python3 -m ssm_precision.run_server --model ...
+
+Or manually:
+    import ssm_precision.hook  # applies patch if SSM_PRECISION_DTYPE != fp32
 """
 
 import os

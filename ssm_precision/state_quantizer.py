@@ -65,6 +65,9 @@ class StateQuantizer:
         self.axis = axis
         self._gen: torch.Generator | None = None
         self._seed = seed * 1000 + layer
+        # Pre-allocated noise buffer — reused in-place to avoid per-step allocation.
+        # Resized only when the state shape grows (rare); otherwise uniform_() refills it.
+        self._noise: torch.Tensor | None = None
 
     @classmethod
     def from_str(cls, s: str, **kw) -> "StateQuantizer | None":
@@ -133,8 +136,13 @@ class StateQuantizer:
         if self._gen is None:
             self._gen = torch.Generator(device=x.device)
             self._gen.manual_seed(self._seed)
-        return torch.rand(x.shape, generator=self._gen, device=x.device,
-                          dtype=torch.float32)
+        # Reuse pre-allocated buffer; only reallocate when shape grows.
+        # uniform_() fills in-place — avoids a new tensor allocation every decode step.
+        if self._noise is None or self._noise.numel() < x.numel():
+            self._noise = torch.empty(x.shape, device=x.device, dtype=torch.float32)
+        noise = self._noise.view(-1)[: x.numel()].view(x.shape)
+        noise.uniform_(generator=self._gen)
+        return noise
 
     # -- fp8 block scaling ---------------------------------------------------------
 
