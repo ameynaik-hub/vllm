@@ -4,8 +4,6 @@
 
 **Use TP=2, not TP=1.**
 TP=1 with 16K max tokens on a thinking model takes ~6-7h per arm. TP=2 halves that to ~3h.
-Also cap `max_gen_toks=8192` — thinking models rarely need 16K, and 8K cuts time in half again.
-Combined: **~1.5h per arm** vs ~6h with TP=1/16K.
 
 ---
 
@@ -76,7 +74,7 @@ docker run -d --name <NAME> \
       --model_args 'pretrained=<MODEL>,tensor_parallel_size=2,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.85,max_model_len=32768,trust_remote_code=True' \
       --tasks gpqa_diamond_cot_zeroshot,aime24 \
       --apply_chat_template \
-      --gen_kwargs 'max_gen_toks=8192,temperature=0,do_sample=False' \
+      --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
       --output_path $REPO/results/<MODEL_SHORT>/<PRECISION>/lm_eval --log_samples \
       2>&1 | tee $REPO/results/<MODEL_SHORT>/<PRECISION>/lm_eval/run.log
   "
@@ -85,7 +83,7 @@ docker run -d --name <NAME> \
 Key flags vs old plan:
 - `tensor_parallel_size=2` ← was 1
 - `gpu_memory_utilization=0.85` ← was 0.90 (TP=2 needs NCCL init buffer)
-- `max_gen_toks=8192` ← was 16384
+- `max_gen_toks=16384` ← unchanged
 - `--shm-size 64g` ← was 32g (needed for NCCL)
 
 ---
@@ -123,7 +121,7 @@ for cfg in \
         --model_args 'pretrained=$model,tensor_parallel_size=2,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.85,max_model_len=32768,trust_remote_code=True' \
         --tasks gpqa_diamond_cot_zeroshot,aime24 \
         --apply_chat_template \
-        --gen_kwargs 'max_gen_toks=8192,temperature=0,do_sample=False' \
+        --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
         --output_path $outdir --log_samples \
         2>&1 | tee $outdir/run.log
       echo DONE_$name
@@ -147,7 +145,7 @@ done
 | Stage | Est. time |
 |---|---|
 | Model load | ~4 min |
-| GPQA 198 × ~4K tokens at ~1000 tok/s | ~30 min |
-| AIME24 30 × ~4K tokens | ~5 min |
-| **Total per arm** | **~40 min** |
-| 2 rounds of 4 arms | **~1.5h total** |
+| GPQA 198 × ~16K tokens at ~1000 tok/s | ~60 min |
+| AIME24 30 × ~16K tokens | ~10 min |
+| **Total per arm** | **~75 min** |
+| 2 rounds of 4 arms | **~2.5h total** |
