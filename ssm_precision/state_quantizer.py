@@ -75,6 +75,8 @@ class StateQuantizer:
             return cls("fp16", "rtn", **kw)
         if s == "fp16_sr":
             return cls("fp16", "sr", **kw)
+        if s == "fp8_rtn":
+            return cls("fp8", "rtn", **kw)
         if s == "fp8_sr":
             return cls("fp8", "sr", **kw)
         raise ValueError(f"Unknown SSM_PRECISION_DTYPE: {s!r}. "
