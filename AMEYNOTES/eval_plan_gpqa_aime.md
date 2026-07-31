@@ -1,233 +1,153 @@
 # Eval Plan: GPQA + AIME via lm-eval
 
+## Settings (learned from runs)
+
+**Use TP=2, not TP=1.**
+TP=1 with 16K max tokens on a thinking model takes ~6-7h per arm. TP=2 halves that to ~3h.
+Also cap `max_gen_toks=8192` — thinking models rarely need 16K, and 8K cuts time in half again.
+Combined: **~1.5h per arm** vs ~6h with TP=1/16K.
+
+---
+
 ## What we're running
 
 | Benchmark | lm-eval task | Questions |
 |---|---|---|
 | GPQA Diamond | `gpqa_diamond_cot_zeroshot` | 198 |
 | AIME 2024 | `aime24` | 30 |
-| AIME 2025 | `aime25` | 30 |
 
-Two precision arms per model:
-- **FP32**: gold baseline (`SSM_PRECISION_DTYPE=fp32`, hook is no-op)
-- **FP16 RTN**: emulated (`SSM_PRECISION_DTYPE=fp16_rtn`, hook fires after each decode step)
+Models:
+- `Qwen3.5-35B-A3B` — BF16
+- `Qwen3.5-122B-A10B-NVFP4` — NVFP4
 
-Two models, each on a **single GPU (TP=1)**:
-- `Qwen3.5-35B-A3B` — 70 GB BF16, fits on one B200 (183 GB)
-- `Qwen3.5-122B-A10B-NVFP4` — 61 GB NVFP4, fits on one B200 (183 GB)
-
-All 4 arms run simultaneously on 4 separate GPUs (~1h wall-clock total).
-
-```
-GPU 0: 35B  FP32     ─┐
-GPU 1: 35B  FP16 RTN ─┤  all at once
-GPU 2: 122B FP32     ─┤
-GPU 3: 122B FP16 RTN ─┘
-```
+Precision arms: `fp32`, `fp16_rtn`, `fp16_sr`, `fp8_rtn`, `fp8_sr`
 
 ---
 
-## How the hook works with lm-eval
+## GPU layout (TP=2, 8 GPUs → 4 arms at once)
 
-`ssm_precision/run_lmeval.py` does:
-```python
-import ssm_precision.hook   # patches gdn.fused_recurrent_gated_delta_rule_packed_decode
-import runpy
-runpy.run_module("lm_eval.__main__", run_name="__main__", alter_sys=True)
+With TP=2 each arm needs 2 GPUs. 8 GPUs → 4 arms in parallel. Run 6 arms in 2 rounds:
+
+**Round 1** (4 arms):
+```
+GPUs 0,1: 35B  precision_A
+GPUs 2,3: 35B  precision_B
+GPUs 4,5: 122B precision_A
+GPUs 6,7: 122B precision_B
 ```
 
-The monkey-patch fires before lm-eval creates its `LLM()` instance, so every
-GDN decode step goes through the wrapper. No vLLM source changes.
+**Round 2** (2 arms):
+```
+GPUs 0,1: 35B  precision_C
+GPUs 4,5: 122B precision_C
+```
 
 ---
 
 ## Prerequisites (one-time)
 
-### 1. Copy datasets to /tmp (Docker runs as root; NFS has root_squash)
 ```bash
 mkdir -p /tmp/hf_home/datasets
 cp -r /home/scratch.ameyn_gpu_2/hf_cache/datasets/Idavidrein___gpqa         /tmp/hf_home/datasets/
 cp -r /home/scratch.ameyn_gpu_2/hf_cache/datasets/HuggingFaceH4___aime_2024  /tmp/hf_home/datasets/
-cp -r /home/scratch.ameyn_gpu_2/hf_cache/datasets/MathArena___aime_2025      /tmp/hf_home/datasets/
 ```
-
-### 2. Check GPU availability
-```bash
-nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
-```
-Need GPUs 0, 1, 2, 3 free (one per arm).
-
-### 3. Install ssm_precision into site-packages (inside each container)
-Instead of PYTHONPATH, copy `ssm_precision/` into the image's site-packages.
-This avoids any risk of shadowing the installed vllm package.
-Done once per container at startup (see run commands below).
 
 ---
 
-## Run commands
+## Run template
 
 ```bash
 IMG=vllm/vllm-openai:nightly-6a9f24aa8cb856235528d01a829a4ba85fc1c19d
 REPO=/home/scratch.ameyn_gpu_2/vllm-ssm-precision-study
 SCRATCH=/home/scratch.ameyn_gpu_2
-```
 
-Each container startup does:
-1. `pip install lm-eval[api]`
-2. Copy `ssm_precision/` into site-packages (avoids PYTHONPATH / vllm shadowing)
-3. Set `SSM_PRECISION_DTYPE` env var
-4. Run `python3 -m ssm_precision.run_lmeval`
-
-### 35B FP32 — GPU 0
-```bash
-docker run -d --name eval_35b_fp32 \
-  --gpus '"device=0"' --network host --ipc host --shm-size 32g \
-  -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
+docker run -d --name <NAME> \
+  --gpus '"device=<GPU0>,<GPU1>"' \
+  --network host --ipc host --shm-size 64g \
+  -v $SCRATCH:$SCRATCH -v /tmp:/tmp \
+  -e HOME=/root -e SSM_PRECISION_DTYPE=<PRECISION> \
   --entrypoint bash $IMG -c "
     pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
     SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
     cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
     export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
-    export SSM_PRECISION_DTYPE=fp32
     python3 -m ssm_precision.run_lmeval \
       --model vllm \
-      --model_args 'pretrained=$SCRATCH/models/Qwen3.5-35B-A3B,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.90,max_model_len=32768,trust_remote_code=True' \
-      --tasks gpqa_diamond_cot_zeroshot,aime24,aime25 \
+      --model_args 'pretrained=<MODEL>,tensor_parallel_size=2,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.85,max_model_len=32768,trust_remote_code=True' \
+      --tasks gpqa_diamond_cot_zeroshot,aime24 \
       --apply_chat_template \
-      --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
-      --output_path $REPO/results/35b/fp32/lm_eval --log_samples \
-      2>&1 | tee $REPO/results/35b/fp32/lm_eval/run.log
+      --gen_kwargs 'max_gen_toks=8192,temperature=0,do_sample=False' \
+      --output_path $REPO/results/<MODEL_SHORT>/<PRECISION>/lm_eval --log_samples \
+      2>&1 | tee $REPO/results/<MODEL_SHORT>/<PRECISION>/lm_eval/run.log
   "
 ```
 
-### 35B FP16 RTN — GPU 1
-```bash
-docker run -d --name eval_35b_fp16rtn \
-  --gpus '"device=1"' --network host --ipc host --shm-size 32g \
-  -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
-  --entrypoint bash $IMG -c "
-    pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
-    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
-    export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
-    export SSM_PRECISION_DTYPE=fp16_rtn
-    python3 -m ssm_precision.run_lmeval \
-      --model vllm \
-      --model_args 'pretrained=$SCRATCH/models/Qwen3.5-35B-A3B,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.90,max_model_len=32768,trust_remote_code=True' \
-      --tasks gpqa_diamond_cot_zeroshot,aime24,aime25 \
-      --apply_chat_template \
-      --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
-      --output_path $REPO/results/35b/fp16rtn/lm_eval --log_samples \
-      2>&1 | tee $REPO/results/35b/fp16rtn/lm_eval/run.log
-  "
-```
+Key flags vs old plan:
+- `tensor_parallel_size=2` ← was 1
+- `gpu_memory_utilization=0.85` ← was 0.90 (TP=2 needs NCCL init buffer)
+- `max_gen_toks=8192` ← was 16384
+- `--shm-size 64g` ← was 32g (needed for NCCL)
 
-### 122B FP32 — GPU 2
-```bash
-docker run -d --name eval_122b_fp32 \
-  --gpus '"device=2"' --network host --ipc host --shm-size 64g \
-  -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
-  --entrypoint bash $IMG -c "
-    pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
-    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
-    export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
-    export SSM_PRECISION_DTYPE=fp32
-    python3 -m ssm_precision.run_lmeval \
-      --model vllm \
-      --model_args 'pretrained=$SCRATCH/models/Qwen3.5-122B-A10B-NVFP4,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.90,max_model_len=32768,trust_remote_code=True' \
-      --tasks gpqa_diamond_cot_zeroshot,aime24,aime25 \
-      --apply_chat_template \
-      --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
-      --output_path $REPO/results/122b/fp32/lm_eval --log_samples \
-      2>&1 | tee $REPO/results/122b/fp32/lm_eval/run.log
-  "
-```
+---
 
-### 122B FP16 RTN — GPU 3
+## Full Round 1 commands (4 arms, copy-paste)
+
 ```bash
-docker run -d --name eval_122b_fp16rtn \
-  --gpus '"device=3"' --network host --ipc host --shm-size 64g \
-  -v $SCRATCH:$SCRATCH -v /tmp:/tmp -e HOME=/root \
-  --entrypoint bash $IMG -c "
-    pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
-    SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
-    cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
-    export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
-    export SSM_PRECISION_DTYPE=fp16_rtn
-    python3 -m ssm_precision.run_lmeval \
-      --model vllm \
-      --model_args 'pretrained=$SCRATCH/models/Qwen3.5-122B-A10B-NVFP4,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.90,max_model_len=32768,trust_remote_code=True' \
-      --tasks gpqa_diamond_cot_zeroshot,aime24,aime25 \
-      --apply_chat_template \
-      --gen_kwargs 'max_gen_toks=16384,temperature=0,do_sample=False' \
-      --output_path $REPO/results/122b/fp16rtn/lm_eval --log_samples \
-      2>&1 | tee $REPO/results/122b/fp16rtn/lm_eval/run.log
-  "
+IMG=vllm/vllm-openai:nightly-6a9f24aa8cb856235528d01a829a4ba85fc1c19d
+REPO=/home/scratch.ameyn_gpu_2/vllm-ssm-precision-study
+SCRATCH=/home/scratch.ameyn_gpu_2
+M35=$SCRATCH/models/Qwen3.5-35B-A3B
+M122=$SCRATCH/models/Qwen3.5-122B-A10B-NVFP4
+
+for cfg in \
+  "eval_35b_fp32:0,1:$M35:fp32:35b/fp32" \
+  "eval_35b_fp16rtn:2,3:$M35:fp16_rtn:35b/fp16rtn" \
+  "eval_122b_fp32:4,5:$M122:fp32:122b/fp32" \
+  "eval_122b_fp16rtn:6,7:$M122:fp16_rtn:122b/fp16rtn"; do
+  IFS=: read -r name gpus model prec outkey <<< "$cfg"
+  outdir=$REPO/results/$outkey/lm_eval
+  mkdir -p $outdir
+  docker rm -f $name 2>/dev/null || true
+  docker run -d --name $name \
+    --gpus "\"device=$gpus\"" \
+    --network host --ipc host --shm-size 64g \
+    -v $SCRATCH:$SCRATCH -v /tmp:/tmp \
+    -e HOME=/root -e SSM_PRECISION_DTYPE=$prec \
+    --entrypoint bash $IMG -c "
+      pip install -q 'lm-eval[api]' 2>&1 | grep -v notice
+      SITELIB=\$(python3 -c 'import site; print(site.getsitepackages()[0])')
+      cp -r $REPO/ssm_precision/ \$SITELIB/ssm_precision/
+      export HF_HOME=/tmp/hf_home HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 DATASETS_OFFLINE=1
+      python3 -m ssm_precision.run_lmeval \
+        --model vllm \
+        --model_args 'pretrained=$model,tensor_parallel_size=2,enforce_eager=True,dtype=bfloat16,mamba_ssm_cache_dtype=float32,gpu_memory_utilization=0.85,max_model_len=32768,trust_remote_code=True' \
+        --tasks gpqa_diamond_cot_zeroshot,aime24 \
+        --apply_chat_template \
+        --gen_kwargs 'max_gen_toks=8192,temperature=0,do_sample=False' \
+        --output_path $outdir --log_samples \
+        2>&1 | tee $outdir/run.log
+      echo DONE_$name
+    " >> $REPO/results/${name}_tp2.log 2>&1
+  echo "Launched $name on GPUs $gpus"
+done
 ```
 
 ---
 
-## Monitor
+## Notes
 
-```bash
-# Status
-docker ps --filter "name=eval_" --format "table {{.Names}}\t{{.Status}}"
-
-# Hook verification (fp16 arms only)
-docker logs eval_35b_fp16rtn  2>&1 | grep ssm_precision
-docker logs eval_122b_fp16rtn 2>&1 | grep ssm_precision
-# Expected: [ssm_precision] monkey-patch active: fp16_rtn
-
-# Progress
-docker logs eval_35b_fp32 2>&1 | grep -E "Running|acc|score|Error" | tail -5
-```
+- **TP=2 + NCCL startup memory**: expect ~22-44 GB used at startup (not model weights). Use `gpu_memory_utilization=0.85` to leave room. With 2× B200s at 183 GB each, 35B (35 GB/GPU) and 122B (30 GB/GPU) both fit easily.
+- **Results dir**: lm-eval saves to `results/<model>/<precision>/lm_eval/__home__...__model/`
+- **Hook verification**: `docker logs <name> 2>&1 | grep ssm_precision` — must appear for non-fp32 arms
 
 ---
 
-## Results location
+## Timing (TP=2, max_gen_toks=8192)
 
-```
-results/
-  35b/  fp32/lm_eval/results_*.json   ← scores
-        fp16rtn/lm_eval/results_*.json
-  122b/ fp32/lm_eval/results_*.json
-        fp16rtn/lm_eval/results_*.json
-```
-
-Key fields in `results_*.json`:
-```json
-{
-  "results": {
-    "gpqa_diamond_cot_zeroshot": { "acc,none": 0.XX },
-    "aime24":                    { "exact_match,none": X.X },
-    "aime25":                    { "exact_match,none": X.X }
-  }
-}
-```
-
----
-
-## Gotchas
-
-1. **NFS root_squash**: copy datasets to `/tmp/hf_home/` before running (see Prerequisites).
-2. **ssm_precision into site-packages** (not PYTHONPATH): avoids shadowing the installed vllm.
-   Each container does `cp -r $REPO/ssm_precision/ $(site-packages)/ssm_precision/`.
-3. **Hook check**: FP32 arms must NOT show `[ssm_precision]`; FP16 arms must show it.
-4. **TP=1, gpu_memory_utilization=0.90**: no NCCL overhead, clean startup on a free B200.
-5. **Results dir must be world-writable** (Docker writes as root):
-   ```bash
-   chmod -R 777 /home/scratch.ameyn_gpu_2/vllm-ssm-precision-study/results/
-   ```
-
----
-
-## Timing estimate (TP=1, temperature=0)
-
-| Benchmark | Questions | Est. time |
-|---|---|---|
-| GPQA (198 × ~8K tokens) | 198 | ~45 min |
-| AIME24 + AIME25 (60 total) | 60 | ~15 min |
-| **Total per arm** | | **~1 hour** |
-
-All 4 arms run in parallel → **~1 hour wall-clock total**.
+| Stage | Est. time |
+|---|---|
+| Model load | ~4 min |
+| GPQA 198 × ~4K tokens at ~1000 tok/s | ~30 min |
+| AIME24 30 × ~4K tokens | ~5 min |
+| **Total per arm** | **~40 min** |
+| 2 rounds of 4 arms | **~1.5h total** |
